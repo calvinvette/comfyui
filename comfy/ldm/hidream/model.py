@@ -8,25 +8,13 @@ from einops import repeat
 from comfy.ldm.lightricks.model import TimestepEmbedding, Timesteps
 import torch.nn.functional as F
 
-from comfy.ldm.flux.math import apply_rope
+from comfy.ldm.flux.math import apply_rope, rope
+from comfy.ldm.flux.layers import LastLayer
+
 from comfy.ldm.modules.attention import optimized_attention
 import comfy.model_management
-
-# Copied from https://github.com/black-forest-labs/flux/blob/main/src/flux/math.py
-def rope(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
-    assert dim % 2 == 0, "The dimension must be even."
-
-    scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
-    omega = 1.0 / (theta**scale)
-
-    batch_size, seq_length = pos.shape
-    out = torch.einsum("...n,d->...nd", pos, omega)
-    cos_out = torch.cos(out)
-    sin_out = torch.sin(out)
-
-    stacked_out = torch.stack([cos_out, -sin_out, sin_out, cos_out], dim=-1)
-    out = stacked_out.view(batch_size, -1, dim // 2, 2, 2)
-    return out.float()
+import comfy.patcher_extension
+import comfy.ldm.common_dit
 
 
 # Copied from https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/layers.py
@@ -84,25 +72,8 @@ class TimestepEmbed(nn.Module):
         return t_emb
 
 
-class OutEmbed(nn.Module):
-    def __init__(self, hidden_size, patch_size, out_channels, dtype=None, device=None, operations=None):
-        super().__init__()
-        self.norm_final = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
-        self.linear = operations.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True, dtype=dtype, device=device)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            operations.Linear(hidden_size, 2 * hidden_size, bias=True, dtype=dtype, device=device)
-        )
-
-    def forward(self, x, adaln_input):
-        shift, scale = self.adaLN_modulation(adaln_input).chunk(2, dim=1)
-        x = self.norm_final(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-        x = self.linear(x)
-        return x
-
-
-def attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
-    return optimized_attention(query.view(query.shape[0], -1, query.shape[-1] * query.shape[-2]), key.view(key.shape[0], -1, key.shape[-1] * key.shape[-2]), value.view(value.shape[0], -1, value.shape[-1] * value.shape[-2]), query.shape[2])
+def attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, transformer_options={}):
+    return optimized_attention(query.view(query.shape[0], -1, query.shape[-1] * query.shape[-2]), key.view(key.shape[0], -1, key.shape[-1] * key.shape[-2]), value.view(value.shape[0], -1, value.shape[-1] * value.shape[-2]), query.shape[2], transformer_options=transformer_options)
 
 
 class HiDreamAttnProcessor_flashattn:
@@ -115,6 +86,7 @@ class HiDreamAttnProcessor_flashattn:
         image_tokens_masks: Optional[torch.FloatTensor] = None,
         text_tokens: Optional[torch.FloatTensor] = None,
         rope: torch.FloatTensor = None,
+        transformer_options={},
         *args,
         **kwargs,
     ) -> torch.FloatTensor:
@@ -162,7 +134,7 @@ class HiDreamAttnProcessor_flashattn:
             query = torch.cat([query_1, query_2], dim=-1)
             key = torch.cat([key_1, key_2], dim=-1)
 
-        hidden_states = attention(query, key, value)
+        hidden_states = attention(query, key, value, transformer_options=transformer_options)
 
         if not attn.single:
             hidden_states_i, hidden_states_t = torch.split(hidden_states, [num_image_tokens, num_text_tokens], dim=1)
@@ -228,6 +200,7 @@ class HiDreamAttention(nn.Module):
         image_tokens_masks: torch.FloatTensor = None,
         norm_text_tokens: torch.FloatTensor = None,
         rope: torch.FloatTensor = None,
+        transformer_options={},
     ) -> torch.Tensor:
         return self.processor(
             self,
@@ -235,6 +208,7 @@ class HiDreamAttention(nn.Module):
             image_tokens_masks = image_tokens_masks,
             text_tokens = norm_text_tokens,
             rope = rope,
+            transformer_options=transformer_options,
         )
 
 
@@ -435,7 +409,7 @@ class HiDreamImageSingleTransformerBlock(nn.Module):
         text_tokens: Optional[torch.FloatTensor] = None,
         adaln_input: Optional[torch.FloatTensor] = None,
         rope: torch.FloatTensor = None,
-
+        transformer_options={},
     ) -> torch.FloatTensor:
         wtype = image_tokens.dtype
         shift_msa_i, scale_msa_i, gate_msa_i, shift_mlp_i, scale_mlp_i, gate_mlp_i = \
@@ -448,6 +422,7 @@ class HiDreamImageSingleTransformerBlock(nn.Module):
             norm_image_tokens,
             image_tokens_masks,
             rope = rope,
+            transformer_options=transformer_options,
         )
         image_tokens = gate_msa_i * attn_output_i + image_tokens
 
@@ -512,6 +487,7 @@ class HiDreamImageTransformerBlock(nn.Module):
         text_tokens: Optional[torch.FloatTensor] = None,
         adaln_input: Optional[torch.FloatTensor] = None,
         rope: torch.FloatTensor = None,
+        transformer_options={},
     ) -> torch.FloatTensor:
         wtype = image_tokens.dtype
         shift_msa_i, scale_msa_i, gate_msa_i, shift_mlp_i, scale_mlp_i, gate_mlp_i, \
@@ -529,6 +505,7 @@ class HiDreamImageTransformerBlock(nn.Module):
             image_tokens_masks,
             norm_text_tokens,
             rope = rope,
+            transformer_options=transformer_options,
         )
 
         image_tokens = gate_msa_i * attn_output_i + image_tokens
@@ -579,6 +556,7 @@ class HiDreamImageBlock(nn.Module):
         text_tokens: Optional[torch.FloatTensor] = None,
         adaln_input: torch.FloatTensor = None,
         rope: torch.FloatTensor = None,
+        transformer_options={},
     ) -> torch.FloatTensor:
         return self.block(
             image_tokens,
@@ -586,6 +564,7 @@ class HiDreamImageBlock(nn.Module):
             text_tokens,
             adaln_input,
             rope,
+            transformer_options=transformer_options,
         )
 
 
@@ -663,7 +642,7 @@ class HiDreamImageTransformer2DModel(nn.Module):
             ]
         )
 
-        self.final_layer = OutEmbed(self.inner_dim, patch_size, self.out_channels, dtype=dtype, device=device, operations=operations)
+        self.final_layer = LastLayer(self.inner_dim, patch_size, self.out_channels, dtype=dtype, device=device, operations=operations)
 
         caption_channels = [caption_channels[1], ] * (num_layers + num_single_layers) + [caption_channels[0], ]
         caption_projection = []
@@ -722,17 +701,37 @@ class HiDreamImageTransformer2DModel(nn.Module):
             raise NotImplementedError
         return x, x_masks, img_sizes
 
-    def forward(
+    def forward(self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        y: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        encoder_hidden_states_llama3=None,
+        image_cond=None,
+        control = None,
+        transformer_options = {},
+    ):
+        return comfy.patcher_extension.WrapperExecutor.new_class_executor(
+            self._forward,
+            self,
+            comfy.patcher_extension.get_all_wrappers(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, transformer_options)
+        ).execute(x, t, y, context, encoder_hidden_states_llama3, image_cond, control, transformer_options)
+
+    def _forward(
         self,
         x: torch.Tensor,
         t: torch.Tensor,
         y: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         encoder_hidden_states_llama3=None,
+        image_cond=None,
         control = None,
         transformer_options = {},
     ) -> torch.Tensor:
-        hidden_states = x
+        bs, c, h, w = x.shape
+        if image_cond is not None:
+            x = torch.cat([x, image_cond], dim=-1)
+        hidden_states = comfy.ldm.common_dit.pad_to_patch_size(x, (self.patch_size, self.patch_size))
         timesteps = t
         pooled_embeds = y
         T5_encoder_hidden_states = context
@@ -795,6 +794,7 @@ class HiDreamImageTransformer2DModel(nn.Module):
                 text_tokens = cur_encoder_hidden_states,
                 adaln_input = adaln_input,
                 rope = rope,
+                transformer_options=transformer_options,
             )
             initial_encoder_hidden_states = initial_encoder_hidden_states[:, :initial_encoder_hidden_states_seq_len]
             block_id += 1
@@ -818,6 +818,7 @@ class HiDreamImageTransformer2DModel(nn.Module):
                 text_tokens=None,
                 adaln_input=adaln_input,
                 rope=rope,
+                transformer_options=transformer_options,
             )
             hidden_states = hidden_states[:, :hidden_states_seq_len]
             block_id += 1
@@ -825,4 +826,4 @@ class HiDreamImageTransformer2DModel(nn.Module):
         hidden_states = hidden_states[:, :image_tokens_seq_len, ...]
         output = self.final_layer(hidden_states, adaln_input)
         output = self.unpatchify(output, img_sizes)
-        return -output
+        return -output[:, :, :h, :w]

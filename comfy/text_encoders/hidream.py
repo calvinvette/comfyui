@@ -11,15 +11,16 @@ class HiDreamTokenizer:
     def __init__(self, embedding_directory=None, tokenizer_data={}):
         self.clip_l = sd1_clip.SDTokenizer(embedding_directory=embedding_directory, tokenizer_data=tokenizer_data)
         self.clip_g = sdxl_clip.SDXLClipGTokenizer(embedding_directory=embedding_directory, tokenizer_data=tokenizer_data)
-        self.t5xxl = sd3_clip.T5XXLTokenizer(embedding_directory=embedding_directory, min_length=128, tokenizer_data=tokenizer_data)
+        self.t5xxl = sd3_clip.T5XXLTokenizer(embedding_directory=embedding_directory, min_length=128, max_length=128, tokenizer_data=tokenizer_data)
         self.llama = hunyuan_video.LLAMA3Tokenizer(embedding_directory=embedding_directory, min_length=128, pad_token=128009, tokenizer_data=tokenizer_data)
 
     def tokenize_with_weights(self, text:str, return_word_ids=False, **kwargs):
         out = {}
-        out["g"] = self.clip_g.tokenize_with_weights(text, return_word_ids)
-        out["l"] = self.clip_l.tokenize_with_weights(text, return_word_ids)
-        out["t5xxl"] = self.t5xxl.tokenize_with_weights(text, return_word_ids)
-        out["llama"] = self.llama.tokenize_with_weights(text, return_word_ids)
+        out["g"] = self.clip_g.tokenize_with_weights(text, return_word_ids, **kwargs)
+        out["l"] = self.clip_l.tokenize_with_weights(text, return_word_ids, **kwargs)
+        t5xxl = self.t5xxl.tokenize_with_weights(text, return_word_ids, **kwargs)
+        out["t5xxl"] = [t5xxl[0]]  # Use only first 128 tokens
+        out["llama"] = self.llama.tokenize_with_weights(text, return_word_ids, **kwargs)
         return out
 
     def untokenize(self, token_weight_pair):
@@ -108,14 +109,18 @@ class HiDreamTEModel(torch.nn.Module):
         if self.t5xxl is not None:
             t5_output = self.t5xxl.encode_token_weights(token_weight_pairs_t5)
             t5_out, t5_pooled = t5_output[:2]
+        else:
+            t5_out = None
 
         if self.llama is not None:
             ll_output = self.llama.encode_token_weights(token_weight_pairs_llama)
             ll_out, ll_pooled = ll_output[:2]
             ll_out = ll_out[:, 1:]
+        else:
+            ll_out = None
 
         if t5_out is None:
-            t5_out = torch.zeros((1, 1, 4096), device=comfy.model_management.intermediate_device())
+            t5_out = torch.zeros((1, 128, 4096), device=comfy.model_management.intermediate_device())
 
         if ll_out is None:
             ll_out = torch.zeros((1, 32, 1, 4096), device=comfy.model_management.intermediate_device())
@@ -137,14 +142,14 @@ class HiDreamTEModel(torch.nn.Module):
             return self.llama.load_sd(sd)
 
 
-def hidream_clip(clip_l=True, clip_g=True, t5=True, llama=True, dtype_t5=None, dtype_llama=None, t5xxl_scaled_fp8=None, llama_scaled_fp8=None):
+def hidream_clip(clip_l=True, clip_g=True, t5=True, llama=True, dtype_t5=None, dtype_llama=None, t5_quantization_metadata=None, llama_quantization_metadata=None):
     class HiDreamTEModel_(HiDreamTEModel):
         def __init__(self, device="cpu", dtype=None, model_options={}):
-            if t5xxl_scaled_fp8 is not None and "t5xxl_scaled_fp8" not in model_options:
+            if t5_quantization_metadata is not None:
                 model_options = model_options.copy()
-                model_options["t5xxl_scaled_fp8"] = t5xxl_scaled_fp8
-            if llama_scaled_fp8 is not None and "llama_scaled_fp8" not in model_options:
+                model_options["t5xxl_quantization_metadata"] = t5_quantization_metadata
+            if llama_quantization_metadata is not None:
                 model_options = model_options.copy()
-                model_options["llama_scaled_fp8"] = llama_scaled_fp8
+                model_options["llama_quantization_metadata"] = llama_quantization_metadata
             super().__init__(clip_l=clip_l, clip_g=clip_g, t5=t5, llama=llama, dtype_t5=dtype_t5, dtype_llama=dtype_llama, device=device, dtype=dtype, model_options=model_options)
     return HiDreamTEModel_
